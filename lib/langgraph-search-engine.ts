@@ -1,31 +1,60 @@
 import { StateGraph, END, START, Annotation, MemorySaver } from "@langchain/langgraph";
-import { ChatOpenAI } from "@langchain/openai";
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import {
+	BaseMessage,
+	HumanMessage,
+	SystemMessage,
+} from "@langchain/core/messages";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { generateText, streamText, LanguageModelV1 } from "ai";
 import { FirecrawlClient } from './firecrawl';
 import { ContextProcessor } from './context-processor';
-import { SEARCH_CONFIG, MODEL_CONFIG } from './config';
+import {
+	SEARCH_CONFIG,
+	SearchCustomizationOptions,
+	DEFAULT_SEARCH_OPTIONS,
+	RESPONSE_STYLE_INFO,
+	AIProvider,
+	AVAILABLE_MODELS,
+} from "./config";
 
 // Event types remain the same for frontend compatibility
-export type SearchPhase = 
-  | 'understanding'
-  | 'planning' 
-  | 'searching'
-  | 'analyzing'
-  | 'synthesizing'
-  | 'complete'
-  | 'error';
+export type SearchPhase =
+	| "understanding"
+	| "planning"
+	| "searching"
+	| "analyzing"
+	| "synthesizing"
+	| "complete"
+	| "error";
 
-export type SearchEvent = 
-  | { type: 'phase-update'; phase: SearchPhase; message: string }
-  | { type: 'thinking'; message: string }
-  | { type: 'searching'; query: string; index: number; total: number }
-  | { type: 'found'; sources: Source[]; query: string }
-  | { type: 'scraping'; url: string; index: number; total: number; query: string }
-  | { type: 'content-chunk'; chunk: string }
-  | { type: 'final-result'; content: string; sources: Source[]; followUpQuestions?: string[] }
-  | { type: 'error'; error: string; errorType?: ErrorType }
-  | { type: 'source-processing'; url: string; title: string; stage: 'browsing' | 'extracting' | 'analyzing' }
-  | { type: 'source-complete'; url: string; summary: string };
+export type SearchEvent =
+	| { type: "phase-update"; phase: SearchPhase; message: string }
+	| { type: "thinking"; message: string }
+	| { type: "searching"; query: string; index: number; total: number }
+	| { type: "found"; sources: Source[]; query: string }
+	| {
+			type: "scraping";
+			url: string;
+			index: number;
+			total: number;
+			query: string;
+	  }
+	| { type: "content-chunk"; chunk: string }
+	| {
+			type: "final-result";
+			content: string;
+			sources: Source[];
+			followUpQuestions?: string[];
+	  }
+	| { type: "error"; error: string; errorType?: ErrorType }
+	| {
+			type: "source-processing";
+			url: string;
+			title: string;
+			stage: "browsing" | "extracting" | "analyzing";
+	  }
+	| { type: "source-complete"; url: string; summary: string };
 
 export type ErrorType = 'search' | 'scrape' | 'llm' | 'unknown';
 
@@ -62,7 +91,7 @@ const SearchStateAnnotation = Annotation.Root({
     reducer: (_, y) => y,
     default: () => undefined
   }),
-  
+
   // Process fields
   understanding: Annotation<string | undefined>({
     reducer: (x, y) => y ?? x,
@@ -76,7 +105,7 @@ const SearchStateAnnotation = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => 0
   }),
-  
+
   // Results fields - with proper array reducers
   sources: Annotation<Source[]>({
     reducer: (existing: Source[], update: Source[] | undefined) => {
@@ -109,7 +138,7 @@ const SearchStateAnnotation = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => undefined
   }),
-  
+
   // Answer tracking
   subQueries: Annotation<Array<{
     question: string;
@@ -126,7 +155,7 @@ const SearchStateAnnotation = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => 0
   }),
-  
+
   // Control fields
   phase: Annotation<SearchPhase>({
     reducer: (x, y) => y ?? x,
@@ -171,19 +200,19 @@ export class LangGraphSearchEngine {
   constructor(firecrawl: FirecrawlClient, options?: { enableCheckpointing?: boolean }) {
     this.firecrawl = firecrawl;
     this.contextProcessor = new ContextProcessor();
-    
+
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       throw new Error('OPENAI_API_KEY environment variable is not set');
     }
-    
+
     // Initialize LangChain models
     this.llm = new ChatOpenAI({
       modelName: MODEL_CONFIG.FAST_MODEL,
       temperature: MODEL_CONFIG.TEMPERATURE,
       openAIApiKey: apiKey,
     });
-    
+
     this.streamingLlm = new ChatOpenAI({
       modelName: MODEL_CONFIG.QUALITY_MODEL,
       temperature: MODEL_CONFIG.TEMPERATURE,
@@ -195,7 +224,7 @@ export class LangGraphSearchEngine {
     if (options?.enableCheckpointing) {
       this.checkpointer = new MemorySaver();
     }
-    
+
     this.graph = this.buildGraph();
   }
 
@@ -219,12 +248,12 @@ export class LangGraphSearchEngine {
     const generateFollowUpQuestions = this.generateFollowUpQuestions.bind(this);
     const firecrawl = this.firecrawl;
     const contextProcessor = this.contextProcessor;
-    
+
     const workflow = new StateGraph(SearchStateAnnotation)
       // Understanding node
       .addNode("understand", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
-        
+
         if (eventCallback) {
           eventCallback({
             type: 'phase-update',
@@ -232,17 +261,17 @@ export class LangGraphSearchEngine {
             message: 'Analyzing your request...'
           });
         }
-        
+
         try {
           const understanding = await analyzeQuery(state.query, state.context);
-          
+
           if (eventCallback) {
             eventCallback({
               type: 'thinking',
               message: understanding
             });
           }
-          
+
           return {
             understanding,
             phase: 'planning' as SearchPhase
@@ -255,11 +284,11 @@ export class LangGraphSearchEngine {
           };
         }
       })
-      
+
       // Planning node
       .addNode("plan", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
-        
+
         if (eventCallback) {
           eventCallback({
             type: 'phase-update',
@@ -267,7 +296,7 @@ export class LangGraphSearchEngine {
             message: 'Planning search strategy...'
           });
         }
-        
+
         try {
           // Extract sub-queries if not already done
           let subQueries = state.subQueries;
@@ -282,10 +311,10 @@ export class LangGraphSearchEngine {
               sources: []
             }));
           }
-          
+
           // Generate search queries for unanswered questions
           const unansweredQueries = subQueries.filter(sq => !sq.answered || sq.confidence < SEARCH_CONFIG.MIN_ANSWER_CONFIDENCE);
-          
+
           if (unansweredQueries.length === 0) {
             // All questions answered, skip to analysis
             return {
@@ -293,13 +322,13 @@ export class LangGraphSearchEngine {
               phase: 'analyzing' as SearchPhase
             };
           }
-          
+
           // Use alternative search queries if this is a retry
           let searchQueries: string[];
           if (state.searchAttempt > 0) {
             const generateAlternativeSearchQueries = this.generateAlternativeSearchQueries.bind(this);
             searchQueries = await generateAlternativeSearchQueries(subQueries, state.searchAttempt);
-            
+
             // Update sub-queries with new search queries
             let alternativeIndex = 0;
             subQueries.forEach(sq => {
@@ -314,15 +343,16 @@ export class LangGraphSearchEngine {
             // First attempt - use the search queries from sub-queries
             searchQueries = unansweredQueries.map(sq => sq.searchQuery);
           }
-          
+
           if (eventCallback) {
             if (state.searchAttempt === 0) {
               eventCallback({
-                type: 'thinking',
-                message: searchQueries.length > 3 
-                  ? `I detected ${subQueries.length} different questions. I'll search for each one separately.`
-                  : `I'll search for information to answer your question.`
-              });
+								type: "thinking",
+								message:
+									searchQueries.length > 3 ?
+										`I detected ${subQueries.length} different questions. I'll search for each one separately.`
+									:	`I'll search for information to answer your question.`,
+							});
             } else {
               eventCallback({
                 type: 'thinking',
@@ -330,7 +360,7 @@ export class LangGraphSearchEngine {
               });
             }
           }
-          
+
           return {
             searchQueries,
             subQueries,
@@ -345,13 +375,13 @@ export class LangGraphSearchEngine {
           };
         }
       })
-      
+
       // Search node (handles one search at a time)
       .addNode("search", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
         const searchQueries = state.searchQueries || [];
         const currentIndex = state.currentSearchIndex || 0;
-        
+
         if (currentIndex === 0 && eventCallback) {
           eventCallback({
             type: 'phase-update',
@@ -359,15 +389,15 @@ export class LangGraphSearchEngine {
             message: 'Searching the web...'
           });
         }
-        
+
         if (currentIndex >= searchQueries.length) {
           return {
             phase: 'scrape' as SearchPhase
           };
         }
-        
+
         const searchQuery = searchQueries[currentIndex];
-        
+
         if (eventCallback) {
           eventCallback({
             type: 'searching',
@@ -376,7 +406,7 @@ export class LangGraphSearchEngine {
             total: searchQueries.length
           });
         }
-        
+
         try {
           const results = await firecrawl.search(searchQuery, {
             limit: SEARCH_CONFIG.MAX_SOURCES_PER_SEARCH,
@@ -384,14 +414,14 @@ export class LangGraphSearchEngine {
               formats: ['markdown']
             }
           });
-          
+
           const newSources: Source[] = results.data.map((r: SearchResult) => ({
             url: r.url,
             title: r.title,
             content: r.markdown || r.content || '',
             quality: 0
           }));
-          
+
           if (eventCallback) {
             eventCallback({
               type: 'found',
@@ -399,7 +429,7 @@ export class LangGraphSearchEngine {
               query: searchQuery
             });
           }
-          
+
           // Process sources in parallel for better performance
           if (SEARCH_CONFIG.PARALLEL_SUMMARY_GENERATION) {
             await Promise.all(newSources.map(async (source) => {
@@ -411,18 +441,18 @@ export class LangGraphSearchEngine {
                   stage: 'browsing'
                 });
               }
-              
+
               // Score the content
               source.quality = scoreContent(source.content || '', state.query);
-              
+
               // Generate summary if content is available
               if (source.content && source.content.length > SEARCH_CONFIG.MIN_CONTENT_LENGTH) {
                 const summary = await summarizeContent(source.content, searchQuery);
-                
+
                 // Store the summary in the source object
                 if (summary && !summary.toLowerCase().includes('no specific')) {
                   source.summary = summary;
-                  
+
                   if (eventCallback) {
                     eventCallback({
                       type: 'source-complete',
@@ -444,21 +474,21 @@ export class LangGraphSearchEngine {
                   stage: 'browsing'
                 });
               }
-              
+
               // Small delay for animation
               await new Promise(resolve => setTimeout(resolve, SEARCH_CONFIG.SOURCE_ANIMATION_DELAY));
-              
+
               // Score the content
               source.quality = scoreContent(source.content || '', state.query);
-              
+
               // Generate summary if content is available
               if (source.content && source.content.length > SEARCH_CONFIG.MIN_CONTENT_LENGTH) {
                 const summary = await summarizeContent(source.content, searchQuery);
-                
+
                 // Store the summary in the source object
                 if (summary && !summary.toLowerCase().includes('no specific')) {
                   source.summary = summary;
-                  
+
                   if (eventCallback) {
                     eventCallback({
                       type: 'source-complete',
@@ -470,7 +500,7 @@ export class LangGraphSearchEngine {
               }
             }
           }
-          
+
           return {
             sources: newSources,
             currentSearchIndex: currentIndex + 1
@@ -482,25 +512,29 @@ export class LangGraphSearchEngine {
           };
         }
       })
-      
+
       // Scraping node
       .addNode("scrape", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
-        const sourcesToScrape = state.sources?.filter(s => 
-          !s.content || s.content.length < SEARCH_CONFIG.MIN_CONTENT_LENGTH
-        ) || [];
+        const sourcesToScrape =
+					state.sources?.filter(
+						(s) =>
+							!s.content || s.content.length < SEARCH_CONFIG.MIN_CONTENT_LENGTH,
+					) || [];
         const newScrapedSources: Source[] = [];
-        
+
         // Sources with content were already processed in search node, just pass them through
-        const sourcesWithContent = state.sources?.filter(s => 
-          s.content && s.content.length >= SEARCH_CONFIG.MIN_CONTENT_LENGTH
-        ) || [];
+        const sourcesWithContent =
+					state.sources?.filter(
+						(s) =>
+							s.content && s.content.length >= SEARCH_CONFIG.MIN_CONTENT_LENGTH,
+					) || [];
         newScrapedSources.push(...sourcesWithContent);
-        
+
         // Then scrape sources without content
         for (let i = 0; i < Math.min(sourcesToScrape.length, SEARCH_CONFIG.MAX_SOURCES_TO_SCRAPE); i++) {
           const source = sourcesToScrape[i];
-          
+
           if (eventCallback) {
             eventCallback({
               type: 'scraping',
@@ -510,7 +544,7 @@ export class LangGraphSearchEngine {
               query: state.query
             });
           }
-          
+
           try {
             const scraped = await firecrawl.scrapeUrl(source.url, SEARCH_CONFIG.SCRAPE_TIMEOUT);
             if (scraped.success && scraped.markdown) {
@@ -520,7 +554,7 @@ export class LangGraphSearchEngine {
                 quality: scoreContent(scraped.markdown, state.query)
               };
               newScrapedSources.push(enrichedSource);
-              
+
               // Show processing animation
               if (eventCallback) {
                 eventCallback({
@@ -530,13 +564,13 @@ export class LangGraphSearchEngine {
                   stage: 'browsing'
                 });
               }
-              
+
               await new Promise(resolve => setTimeout(resolve, 150));
-              
+
               const summary = await summarizeContent(scraped.markdown, state.query);
               if (summary) {
                 enrichedSource.summary = summary;
-                
+
                 if (eventCallback) {
                   eventCallback({
                     type: 'source-complete',
@@ -562,17 +596,17 @@ export class LangGraphSearchEngine {
             }
           }
         }
-        
+
         return {
           scrapedSources: newScrapedSources,
           phase: 'analyzing' as SearchPhase
         };
       })
-      
+
       // Analyzing node
       .addNode("analyze", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
-        
+
         if (eventCallback) {
           eventCallback({
             type: 'phase-update',
@@ -580,31 +614,31 @@ export class LangGraphSearchEngine {
             message: 'Analyzing gathered information...'
           });
         }
-        
+
         // Combine sources and remove duplicates by URL
         const sourceMap = new Map<string, Source>();
-        
+
         // Add all sources (not just those with long content, since summaries contain key info)
         (state.sources || []).forEach(s => sourceMap.set(s.url, s));
-        
+
         // Add scraped sources (may override with better content)
         (state.scrapedSources || []).forEach(s => sourceMap.set(s.url, s));
-        
+
         const allSources = Array.from(sourceMap.values());
-        
+
         // Check which questions have been answered
         if (state.subQueries) {
           const checkAnswersInSources = this.checkAnswersInSources.bind(this);
           const updatedSubQueries = await checkAnswersInSources(state.subQueries, allSources);
-          
+
           const answeredCount = updatedSubQueries.filter(sq => sq.answered).length;
           const totalQuestions = updatedSubQueries.length;
           const searchAttempt = (state.searchAttempt || 0) + 1;
-          
+
           // Check if we have partial answers with decent confidence
           const partialAnswers = updatedSubQueries.filter(sq => sq.confidence >= 0.3);
           const hasPartialInfo = partialAnswers.length > answeredCount;
-          
+
           if (eventCallback) {
             if (answeredCount === totalQuestions) {
               eventCallback({
@@ -636,20 +670,22 @@ export class LangGraphSearchEngine {
               });
             }
           }
-          
+
           // If we haven't found all answers and haven't exceeded attempts, try again
           // BUT stop if we have partial info and already tried 2+ times
-          if (answeredCount < totalQuestions && 
-              searchAttempt < SEARCH_CONFIG.MAX_SEARCH_ATTEMPTS &&
-              !(hasPartialInfo && searchAttempt >= 2)) {
-            return {
-              sources: allSources,
-              subQueries: updatedSubQueries,
-              searchAttempt,
-              phase: 'planning' as SearchPhase  // Go back to planning for retry
-            };
-          }
-          
+          if (
+						answeredCount < totalQuestions &&
+						searchAttempt < SEARCH_CONFIG.MAX_SEARCH_ATTEMPTS &&
+						!(hasPartialInfo && searchAttempt >= 2)
+					) {
+						return {
+							sources: allSources,
+							subQueries: updatedSubQueries,
+							searchAttempt,
+							phase: "planning" as SearchPhase, // Go back to planning for retry
+						};
+					}
+
           // Otherwise proceed with what we have
           try {
             const processedSources = await contextProcessor.processSources(
@@ -657,7 +693,7 @@ export class LangGraphSearchEngine {
               allSources,
               state.searchQueries || []
             );
-            
+
             return {
               sources: allSources,
               processedSources,
@@ -682,14 +718,14 @@ export class LangGraphSearchEngine {
               message: `Found ${allSources.length} sources with quality information`
             });
           }
-          
+
           try {
             const processedSources = await contextProcessor.processSources(
               state.query,
               allSources,
               state.searchQueries || []
             );
-            
+
             return {
               sources: allSources,
               processedSources,
@@ -704,11 +740,11 @@ export class LangGraphSearchEngine {
           }
         }
       })
-      
+
       // Synthesizing node with streaming
       .addNode("synthesize", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
-        
+
         if (eventCallback) {
           eventCallback({
             type: 'phase-update',
@@ -716,10 +752,10 @@ export class LangGraphSearchEngine {
             message: 'Creating comprehensive answer...'
           });
         }
-        
+
         try {
           const sourcesToUse = state.processedSources || state.sources || [];
-          
+
           const answer = await generateStreamingAnswer(
             state.query,
             sourcesToUse,
@@ -730,7 +766,7 @@ export class LangGraphSearchEngine {
             },
             state.context
           );
-          
+
           // Generate follow-up questions
           const followUpQuestions = await generateFollowUpQuestions(
             state.query,
@@ -738,7 +774,7 @@ export class LangGraphSearchEngine {
             sourcesToUse,
             state.context
           );
-          
+
           return {
             finalAnswer: answer,
             followUpQuestions,
@@ -752,11 +788,11 @@ export class LangGraphSearchEngine {
           };
         }
       })
-      
+
       // Error handling node
       .addNode("handleError", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
-        
+
         if (eventCallback) {
           eventCallback({
             type: 'error',
@@ -764,13 +800,13 @@ export class LangGraphSearchEngine {
             errorType: state.errorType
           });
         }
-        
+
         // Retry logic based on error type
         if ((state.retryCount || 0) < (state.maxRetries || SEARCH_CONFIG.MAX_RETRIES)) {
-              
+
           // Different retry strategies based on error type
           const retryPhase = state.errorType === 'search' ? 'searching' : 'understanding';
-          
+
           return {
             retryCount: (state.retryCount || 0) + 1,
             phase: retryPhase as SearchPhase,
@@ -778,23 +814,23 @@ export class LangGraphSearchEngine {
             errorType: undefined
           };
         }
-        
+
         return {
           phase: 'error' as SearchPhase
         };
       })
-      
+
       // Complete node
       .addNode("complete", async (state: SearchState, config?: GraphConfig): Promise<Partial<SearchState>> => {
         const eventCallback = config?.configurable?.eventCallback;
-        
+
         if (eventCallback) {
           eventCallback({
             type: 'phase-update',
             phase: 'complete',
             message: 'Search complete!'
           });
-          
+
           eventCallback({
             type: 'final-result',
             content: state.finalAnswer || '',
@@ -802,7 +838,7 @@ export class LangGraphSearchEngine {
             followUpQuestions: state.followUpQuestions
           });
         }
-        
+
         return {
           phase: 'complete' as SearchPhase
         };
@@ -938,15 +974,15 @@ export class LangGraphSearchEngine {
   // Get current date for context
   private getCurrentDateContext(): string {
     const now = new Date();
-    const dateStr = now.toLocaleDateString('en-US', { 
-      weekday: 'long', 
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric' 
-    });
+    const dateStr = now.toLocaleDateString("en-US", {
+			weekday: "long",
+			year: "numeric",
+			month: "long",
+			day: "numeric",
+		});
     const year = now.getFullYear();
     const month = now.getMonth() + 1;
-    
+
     return `Today's date is ${dateStr}. The current year is ${year} and it's currently ${month}/${year}.`;
   }
 
@@ -959,7 +995,7 @@ export class LangGraphSearchEngine {
         contextPrompt += `User: ${c.query}\nAssistant: ${c.response.substring(0, SEARCH_CONFIG.CONTEXT_PREVIEW_LENGTH)}...\n\n`;
       });
     }
-    
+
     const messages = [
       new SystemMessage(`${this.getCurrentDateContext()}
 
@@ -975,7 +1011,7 @@ Instructions:
 Keep it natural and conversational, showing you truly understand their request.`),
       new HumanMessage(`Query: "${query}"${contextPrompt}`)
     ];
-    
+
     const response = await this.llm.invoke(messages);
     return response.content.toString();
   }
@@ -985,9 +1021,9 @@ Keep it natural and conversational, showing you truly understand their request.`
     sources: Source[]
   ): Promise<typeof subQueries> {
     if (sources.length === 0) return subQueries;
-    
+
     const messages = [
-      new SystemMessage(`Check which questions have been answered by the provided sources.
+			new SystemMessage(`Check which questions have been answered by the provided sources.
 
 For each question, determine:
 1. If the sources contain a direct answer
@@ -1016,7 +1052,7 @@ Special cases:
 - If asking about a product/model with a version number (e.g., "ModelX v2.5.1" or "Product 0528"), check BOTH:
   1. If sources mention the EXACT version → mark as answered with high confidence (0.8+)
   2. If sources only mention the base product → mark as answered with medium confidence (0.6+)
-- Example: Question "What is ProductX 1234?" 
+- Example: Question "What is ProductX 1234?"
   - If sources mention "ProductX 1234" specifically → confidence: 0.9
   - If sources only mention "ProductX" → confidence: 0.6
 - IMPORTANT: For questions like "What is DeepSeek R1 0528?", if sources contain "DeepSeek R1-0528" or "DeepSeek R1 0528", that's a DIRECT match (confidence 0.9+)
@@ -1034,36 +1070,39 @@ Return ONLY a JSON array, no markdown formatting or code blocks:
     "sources": ["urls that contain the answer"]
   }
 ]`),
-      new HumanMessage(`Questions to check:
-${subQueries.map(sq => sq.question).join('\n')}
+			new HumanMessage(`Questions to check:
+${subQueries.map((sq) => sq.question).join("\n")}
 
 Sources:
-${sources.slice(0, SEARCH_CONFIG.MAX_SOURCES_TO_CHECK).map(s => {
-  let sourceInfo = `URL: ${s.url}\nTitle: ${s.title}\n`;
-  
-  // Include summary if available (this is the key insight from the search)
-  if (s.summary) {
-    sourceInfo += `Summary: ${s.summary}\n`;
-  }
-  
-  // Include content preview
-  if (s.content) {
-    sourceInfo += `Content: ${s.content.slice(0, SEARCH_CONFIG.ANSWER_CHECK_PREVIEW)}\n`;
-  }
-  
-  return sourceInfo;
-}).join('\n---\n')}`)
-    ];
+${sources
+	.slice(0, SEARCH_CONFIG.MAX_SOURCES_TO_CHECK)
+	.map((s) => {
+		let sourceInfo = `URL: ${s.url}\nTitle: ${s.title}\n`;
+
+		// Include summary if available (this is the key insight from the search)
+		if (s.summary) {
+			sourceInfo += `Summary: ${s.summary}\n`;
+		}
+
+		// Include content preview
+		if (s.content) {
+			sourceInfo += `Content: ${s.content.slice(0, SEARCH_CONFIG.ANSWER_CHECK_PREVIEW)}\n`;
+		}
+
+		return sourceInfo;
+	})
+	.join("\n---\n")}`),
+		];
 
     try {
       const response = await this.llm.invoke(messages);
       let content = response.content.toString();
-      
+
       // Strip markdown code blocks if present
       content = content.replace(/```json\s*/g, '').replace(/```\s*$/g, '').trim();
-      
+
       const results = JSON.parse(content);
-      
+
       // Update sub-queries with results
       return subQueries.map(sq => {
         const result = results.find((r: { question: string }) => r.question === sq.question);
@@ -1086,15 +1125,15 @@ ${sources.slice(0, SEARCH_CONFIG.MAX_SOURCES_TO_CHECK).map(s => {
 
   private async extractSubQueries(query: string): Promise<Array<{ question: string; searchQuery: string }>> {
     const messages = [
-      new SystemMessage(`Extract the individual factual questions from this query. Each question should be something that can be definitively answered.
+			new SystemMessage(`Extract the individual factual questions from this query. Each question should be something that can be definitively answered.
 
-IMPORTANT: 
+IMPORTANT:
 - When the user mentions something with a version/number (like "deepseek r1 0528"), include the FULL version in the question
 - For the search query, you can simplify slightly but keep key identifiers
 - Example: "deepseek r1 0528" → question: "What is DeepSeek R1 0528?", searchQuery: "DeepSeek R1 0528"
 
 Examples:
-"Who founded Anthropic and when" → 
+"Who founded Anthropic and when" →
 [
   {"question": "Who founded Anthropic?", "searchQuery": "Anthropic founders"},
   {"question": "When was Anthropic founded?", "searchQuery": "Anthropic founded date year"}
@@ -1120,14 +1159,14 @@ Examples:
   {"question": "What is Model Z 1234?", "searchQuery": "Model Z"}
 ]
 
-Important: 
+Important:
 - For comparison requests, create a single question/search that covers both items
 - If a term looks like it might be a model name with a version/date (like "R1 0528"), treat it as a single entity first, but create a search query that focuses on the main product name
 - Keep the number of sub-queries reasonable (aim for 3-5 max)
 
 Return ONLY a JSON array of {question, searchQuery} objects.`),
-      new HumanMessage(`Query: "${query}"`)
-    ];
+			new HumanMessage(`Query: "${query}"`),
+		];
 
     try {
       const response = await this.llm.invoke(messages);
@@ -1146,7 +1185,7 @@ Return ONLY a JSON array of {question, searchQuery} objects.`),
     previousAttempts: number
   ): Promise<string[]> {
     const unansweredQueries = subQueries.filter(sq => !sq.answered || sq.confidence < SEARCH_CONFIG.MIN_ANSWER_CONFIDENCE);
-    
+
     // If we're on attempt 3 and still searching for the same thing, just give up on that specific query
     if (previousAttempts >= 2) {
       const problematicQueries = unansweredQueries.filter(sq => {
@@ -1155,7 +1194,7 @@ Return ONLY a JSON array of {question, searchQuery} objects.`),
         const hasFailedMultipleTimes = previousAttempts >= 2;
         return hasVersionPattern && hasFailedMultipleTimes;
       });
-      
+
       if (problematicQueries.length > 0) {
         // Return generic searches that might find partial info
         return problematicQueries.map(sq => {
@@ -1164,7 +1203,7 @@ Return ONLY a JSON array of {question, searchQuery} objects.`),
         });
       }
     }
-    
+
     const messages = [
       new SystemMessage(`${this.getCurrentDateContext()}
 
@@ -1195,7 +1234,7 @@ Return one alternative search query per unanswered question, one per line.`),
     try {
       const response = await this.llm.invoke(messages);
       const result = response.content.toString();
-      
+
       const queries = result
         .split('\n')
         .map(q => q.trim())
@@ -1205,7 +1244,7 @@ Return one alternative search query per unanswered question, one per line.`),
         .filter(q => q.length > 0)
         .filter(q => !q.match(/^```/))
         .filter(q => q.length > 3);
-      
+
       return queries.slice(0, SEARCH_CONFIG.MAX_SEARCH_QUERIES);
     } catch {
       // Fallback: return original queries with slight modifications
@@ -1216,12 +1255,12 @@ Return one alternative search query per unanswered question, one per line.`),
   private scoreContent(content: string, query: string): number {
     const queryWords = query.toLowerCase().split(' ');
     const contentLower = content.toLowerCase();
-    
+
     let score = 0;
     for (const word of queryWords) {
       if (contentLower.includes(word)) score += 0.2;
     }
-    
+
     return Math.min(score, 1);
   }
 
@@ -1244,7 +1283,7 @@ Instructions:
 - Don't say "No relevant information was found" - find something relevant to the current search`),
         new HumanMessage(`Query: "${query}"\n\nContent: ${content.slice(0, 2000)}`)
       ];
-      
+
       const response = await this.llm.invoke(messages);
       return response.content.toString().trim();
     } catch {
@@ -1264,7 +1303,7 @@ Instructions:
         return `[${i + 1}] ${s.title}\n${s.content}`;
       })
       .join('\n\n');
-    
+
     let contextPrompt = '';
     if (context && context.length > 0) {
       contextPrompt = '\n\nPrevious conversation for context:\n';
@@ -1272,19 +1311,19 @@ Instructions:
         contextPrompt += `User: ${c.query}\nAssistant: ${c.response.substring(0, 300)}...\n\n`;
       });
     }
-    
+
     const messages = [
       new SystemMessage(`${this.getCurrentDateContext()}
 
 Answer the user's question based on the provided sources. Provide a clear, comprehensive answer with citations [1], [2], etc. Use markdown formatting for better readability. If this question relates to previous topics discussed, make connections where relevant.`),
       new HumanMessage(`Question: "${query}"${contextPrompt}\n\nBased on these sources:\n${sourcesText}`)
     ];
-    
+
     let fullText = '';
-    
+
     try {
       const stream = await this.streamingLlm.stream(messages);
-      
+
       for await (const chunk of stream) {
         const content = chunk.content;
         if (typeof content === 'string') {
@@ -1298,7 +1337,7 @@ Answer the user's question based on the provided sources. Provide a clear, compr
       fullText = response.content.toString();
       onChunk(fullText);
     }
-    
+
     return fullText;
   }
 
@@ -1317,7 +1356,7 @@ Answer the user's question based on the provided sources. Provide a clear, compr
         });
         contextPrompt += '\nConsider the full conversation flow when generating follow-ups.\n';
       }
-      
+
       const messages = [
         new SystemMessage(`${this.getCurrentDateContext()}
 
@@ -1342,14 +1381,14 @@ Examples of good follow-up questions:
 - "How is this typically implemented?"`),
         new HumanMessage(`Original query: "${originalQuery}"\n\nAnswer summary: ${answer.length > 1000 ? answer.slice(0, 1000) + '...' : answer}${contextPrompt}`)
       ];
-      
+
       const response = await this.llm.invoke(messages);
       const questions = response.content.toString()
         .split('\n')
         .map(q => q.trim())
         .filter(q => q.length > 0 && q.length < 80)
         .slice(0, 3);
-      
+
       return questions.length > 0 ? questions : [];
     } catch {
       return [];
